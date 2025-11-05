@@ -2,6 +2,10 @@ import torch
 import torch_gpu_ext
 
 
+myobj = torch_gpu_ext.MyObject(42)
+print(myobj.value())
+
+
 def test_gpu_add():
     a = torch.rand(5).cuda()
     b = torch.rand(5).cuda()

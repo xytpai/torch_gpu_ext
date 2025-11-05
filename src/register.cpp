@@ -1,6 +1,7 @@
 #include <Python.h>
 #include "add_kernel.h"
 #include "mul_kernel.h"
+#include "myobj.h"
 
 extern "C" {
 /* Creates a dummy empty _C module that can be imported from Python.
@@ -23,6 +24,9 @@ PyObject *PyInit__C(void) {
 TORCH_LIBRARY(torch_gpu_ext, m) {
     m.def("gpu_add(Tensor a, Tensor b, Tensor out) -> ()");
     m.def("gpu_mul(Tensor a, Tensor b, Tensor out) -> ()");
+    m.class_<MyObject>("MyObject")
+        .def(torch::init<int64_t>())
+        .def("value", &MyObject::value);
 }
 
 TORCH_LIBRARY_IMPL(torch_gpu_ext, CUDA, m) {
