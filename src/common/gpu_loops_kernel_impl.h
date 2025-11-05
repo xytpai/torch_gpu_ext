@@ -24,7 +24,7 @@ __global__ void gpu_loops_kernel(const T *a, const T *b, T *out, size_t n, func_
         auto out_vec_ptr = reinterpret_cast<vec_t *>(&out[index]);
 #pragma unroll
         for (int i = 0; i < vec_size; ++i) {
-            a_vec.val[i] += b_vec.val[i];
+            a_vec.val[i] = func(a_vec.val[i], b_vec.val[i]);
         }
         *out_vec_ptr = a_vec;
     }

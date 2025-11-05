@@ -18,8 +18,8 @@ void gpu_add(Tensor &a, Tensor &b, Tensor &out) {
         a.scalar_type(),
         "gpu_add", [&] {
             gpu_loops<scalar_t>(
-                a.const_data_ptr<scalar_t>(),
-                b.const_data_ptr<scalar_t>(),
+                a.data_ptr<scalar_t>(),
+                b.data_ptr<scalar_t>(),
                 out.data_ptr<scalar_t>(),
                 (size_t)numel,
                 add_func<scalar_t>());

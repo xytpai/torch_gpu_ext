@@ -10,6 +10,7 @@ def test_gpu_add():
     torch.ops.torch_gpu_ext.gpu_add(a, b, out_ab)
     print("ref_add_out:", ref_ab)
     print("add_out:", out_ab)
+    assert torch.allclose(ref_ab, out_ab)
 
 
 def test_gpu_mul():
@@ -20,6 +21,7 @@ def test_gpu_mul():
     torch.ops.torch_gpu_ext.gpu_mul(a, b, out_ab)
     print("ref_mul_out:", ref_ab)
     print("mul_out:", out_ab)
+    assert torch.allclose(ref_ab, out_ab)
 
 
 if __name__ == "__main__":

@@ -18,8 +18,8 @@ void gpu_mul(Tensor &a, Tensor &b, Tensor &out) {
         a.scalar_type(),
         "gpu_mul", [&] {
             gpu_loops<scalar_t>(
-                a.const_data_ptr<scalar_t>(),
-                b.const_data_ptr<scalar_t>(),
+                a.data_ptr<scalar_t>(),
+                b.data_ptr<scalar_t>(),
                 out.data_ptr<scalar_t>(),
                 (size_t)numel,
                 mul_func<scalar_t>());
