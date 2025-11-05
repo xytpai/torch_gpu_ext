@@ -7,15 +7,15 @@ struct alignas(sizeof(scalar_t) * vec_size) aligned_array {
     scalar_t val[vec_size];
 };
 
-template <typename T>
-__global__ void gpu_add_kernel(const T *a, const T *b, T *out, size_t n) {
+template <typename T, typename func_t>
+__global__ void gpu_loops_kernel(const T *a, const T *b, T *out, size_t n, func_t func) {
     constexpr int vec_size = 16 / sizeof(T);
     int block_work_size = blockDim.x * vec_size;
     size_t index = blockIdx.x * block_work_size + threadIdx.x * vec_size;
     int remaining = n - index;
     if (remaining < vec_size) {
         for (auto i = index; i < n; ++i) {
-            out[i] = a[i] + b[i];
+            out[i] = func(a[i], b[i]);
         }
     } else {
         using vec_t = aligned_array<T, vec_size>;
@@ -30,13 +30,14 @@ __global__ void gpu_add_kernel(const T *a, const T *b, T *out, size_t n) {
     }
 }
 
-template <typename T>
-void gpu_add(const T *a, const T *b, T *out, size_t n) {
+template <typename T, typename func_t>
+void gpu_loops(const T *a, const T *b, T *out, size_t n, func_t func) {
+    std::cout << "into gpu_loops impl with func:" << typeid(func).name() << std::endl;
     constexpr int vec_size = 16 / sizeof(T);
     constexpr int block_size = 256;
     constexpr int block_work_size = block_size * vec_size;
     dim3 threadsPerBlock(block_size);
     dim3 numBlocks((n + block_work_size - 1) / block_work_size);
-    gpu_add_kernel<T><<<numBlocks, threadsPerBlock>>>(a, b, out, n);
+    gpu_loops_kernel<T, func_t><<<numBlocks, threadsPerBlock>>>(a, b, out, n, func);
     gpuDeviceSynchronize();
 }

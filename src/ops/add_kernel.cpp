@@ -1,7 +1,14 @@
-#include "add_kernel.h"
-#include "add_kernel_impl.h"
+#include "gpu_loops_kernel_impl.h"
+#include <torch/extension.h>
 
 using namespace at;
+
+template <typename T>
+struct add_func {
+    __device__ T operator()(T a, T b) const {
+        return a + b;
+    }
+};
 
 void gpu_add(Tensor &a, Tensor &b, Tensor &out) {
     int64_t numel = a.numel();
@@ -10,10 +17,11 @@ void gpu_add(Tensor &a, Tensor &b, Tensor &out) {
         kHalf,
         a.scalar_type(),
         "gpu_add", [&] {
-            gpu_add<scalar_t>(
+            gpu_loops<scalar_t>(
                 a.const_data_ptr<scalar_t>(),
                 b.const_data_ptr<scalar_t>(),
                 out.data_ptr<scalar_t>(),
-                numel);
+                (size_t)numel,
+                add_func<scalar_t>());
         });
 }
