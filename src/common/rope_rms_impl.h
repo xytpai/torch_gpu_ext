@@ -5,24 +5,17 @@ namespace rope_rms {
 
 namespace block_utils {
 
-#ifdef __CUDACC__
 template <typename T>
 __inline__ __device__ T warp_reduce_sum(T val) {
 #pragma unroll
-    for (int mask = 16; mask > 0; mask >>= 1)
-        val += __shfl_xor_sync(0xffffffff, val, mask, 32);
-    return val;
-}
+    for (int offset = 16; offset > 0; offset >>= 1)
+#ifdef __CUDACC__
+        val += __shfl_xor_sync(0xffffffff, val, offset, 32);
 #else
-template <typename T>
-__device__ __forceinline__ T warp_reduce_sum(T val) {
-#pragma unroll
-    for (int offset = (32 >> 1); offset > 0; offset >>= 1) {
         val += __shfl_xor(val, offset, 32);
-    }
+#endif
     return val;
 }
-#endif
 
 template <typename T>
 __inline__ __device__ T block_reduce_sum(T val, int pack_id, int pack_size) {
@@ -37,17 +30,10 @@ __inline__ __device__ T block_reduce_sum(T val, int pack_id, int pack_size) {
     __syncthreads();
     int nw = blockDim.x / 32;
     int nw_packed = nw / pack_size;
-    int wid_packed = wid % nw_packed;
-
-    int w_start = pack_id * nw_packed;
-    int w_end = w_start + nw_packed;
-    w_end = w_end < nw ? w_end : nw;
-
-    T acc = 0;
-    for (int i = w_start; i < w_end; ++i) {
-        acc += shared[i];
-    }
-    return acc;
+    val = (w_tid < nw_packed) ? shared[wid * nw_packed + w_tid] : (T)(0.f);
+    __syncthreads();
+    val = warp_reduce_sum(val);
+    return val;
 }
 
 } // namespace block_utils
@@ -91,6 +77,7 @@ __device__ __forceinline__ vec_t<T, VEC_SIZE> packed_rms_norm(
     float rms_eps,
     int pack_id,
     int pack_size) {
+    __shared__ float s_val[32];
     vec_t<T, VEC_SIZE> norm_out;
     float acc = 0.f;
 #pragma unroll
@@ -99,12 +86,14 @@ __device__ __forceinline__ vec_t<T, VEC_SIZE> packed_rms_norm(
         acc += v * v;
     }
     acc = block_utils::block_reduce_sum<float>(acc, pack_id, pack_size);
-    auto s_val = rsqrtf(acc / rms_dim + rms_eps);
+    if (threadIdx.x % 32 == 0) {
+        s_val[threadIdx.x / 32] = rsqrtf(acc / rms_dim + rms_eps);
+    }
     __syncthreads();
 #pragma unroll
     for (int i = 0; i < VEC_SIZE; ++i) {
         norm_out.data[i] =
-            static_cast<T>(static_cast<float>(reinterpret_cast<T const *>(&input)[i]) * s_val * static_cast<float>(reinterpret_cast<T const *>(&gamma)[i]));
+            static_cast<T>(static_cast<float>(reinterpret_cast<T const *>(&input)[i]) * s_val[pack_id] * static_cast<float>(reinterpret_cast<T const *>(&gamma)[i]));
     }
     return norm_out;
 }
