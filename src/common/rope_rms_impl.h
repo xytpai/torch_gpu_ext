@@ -67,6 +67,14 @@ struct alignas(sizeof(T) * vec_size) vec_t {
     __device__ __forceinline__ void store(T *ptr) {
         *reinterpret_cast<vec_t<T, vec_size> *>(ptr) = *this;
     }
+    __device__ __forceinline__ void nontemporal_load(const T *ptr) {
+        *reinterpret_cast<uint64_t *>(&data[0]) = __builtin_nontemporal_load((uint64_t *)(const_cast<T *>(ptr)));
+        *reinterpret_cast<uint64_t *>(&data[vec_size / 2]) = __builtin_nontemporal_load((uint64_t *)((char *)const_cast<T *>(ptr) + 8));
+    }
+    __device__ __forceinline__ void nontemporal_store(T *ptr) {
+        __builtin_nontemporal_store(*reinterpret_cast<uint64_t *>(&data[0]), (uint64_t *)ptr);
+        __builtin_nontemporal_store(*reinterpret_cast<uint64_t *>(&data[vec_size / 2]), (uint64_t *)((char *)ptr + 8));
+    }
     __device__ __forceinline__ void fill(T val) {
 #pragma unroll
         for (int i = 0; i < vec_size; ++i) {
@@ -112,8 +120,8 @@ __global__ void fused_rope_rms_kernel(const T *q, const T *k, const T *q_w, cons
     // int head_id = blockIdx.x % num_heads;
     int numel = seq_len * num_heads * head_dim;
     vec_t<T, VEC_SIZE> q_w_vec, k_w_vec;
-    q_w_vec.load(q_w + access_id_in_head);
-    k_w_vec.load(k_w + access_id_in_head);
+    q_w_vec.nontemporal_load(q_w + access_id_in_head);
+    k_w_vec.nontemporal_load(k_w + access_id_in_head);
     for (int idx = global_head_id * head_dim + access_id_in_head; idx < numel; idx += gridDim.x * pack_size * head_dim) {
         vec_t<T, VEC_SIZE> q_vec, k_vec;
         q_vec.load(q + idx);
