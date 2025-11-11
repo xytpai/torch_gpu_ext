@@ -83,7 +83,7 @@ public:
                 int half_rotary_dim = rotary_dim / 2;
                 for (int h = 0; h < half_rotary_dim; ++h) {
                     auto cos = cos_sin[tid * head_size + h];
-                    auto sin = cos_sin[tid * head_size + h];
+                    auto sin = cos_sin[tid * head_size + h + half_rotary_dim];
                     if (is_neox_style) {
                         auto q1 = q[offset + h] * beta_q * q_w[h];
                         auto k1 = k[offset + h] * beta_k * k_w[h];
@@ -170,15 +170,15 @@ public:
         gpuEventCreate(&stop);
         gpuEventRecord(start);
 
-        rope_rms::fused_rope_rms(q, k, q_w, k_w, cos_sin, out_q, out_k, num_tokens, num_heads, head_size,
-                                 rotary_dim, is_neox_style, eps, 0);
+        assert(head_size == rotary_dim);
+        rope_rms::fused_rope_rms(q, k, q_w, k_w, cos_sin, out_q, out_k, num_tokens, num_heads, head_size, is_neox_style, eps, 0);
         gpuDeviceSynchronize();
 
         gpuEventRecord(stop);
         gpuEventSynchronize(stop);
         float ms = 0;
         gpuEventElapsedTime(&ms, start, stop);
-        float input_bytes = (numel + head_size) * 2 * sizeof(T);
+        float input_bytes = (numel + head_size) * 2 * sizeof(T) + num_tokens * head_size * sizeof(T);
         float output_bytes = numel * 2 * sizeof(T);
         float gbps = (input_bytes + output_bytes) / 1000.0 / 1000.0 / ms;
         return gbps;
@@ -221,8 +221,8 @@ std::tuple<bool, float> runbench(
     bool is_neox_style,
     float eps,
     float atol = 0.0001) {
-    CPUInputs<T> cpu_inputs(num_tokens, num_heads, head_size, rotary_dim, eps, is_neox_style);
-    GPUInputs<T> gpu_inputs(num_tokens, num_heads, head_size, rotary_dim, eps, is_neox_style);
+    CPUInputs<T> cpu_inputs(num_tokens, num_heads, head_size, rotary_dim, is_neox_style, eps);
+    GPUInputs<T> gpu_inputs(num_tokens, num_heads, head_size, rotary_dim, is_neox_style, eps);
     cpu_inputs.allocate();
     gpu_inputs.allocate();
     cpu_inputs.reset();
@@ -236,18 +236,19 @@ std::tuple<bool, float> runbench(
 } // namespace test
 
 int main() {
+    std::vector<bool> is_neox_styles = {true, false};
     std::vector<int> num_tokens = {513, 1257, 127, 778, 10024, 3};
     std::vector<int> num_heads = {32, 64};
     std::vector<int> head_sizes = {128, 256};
-    int rotary_dim = 128;
-    bool is_neox_style = true;
     float eps = 1e-6;
-    for (auto num_token : num_tokens) {
-        for (auto num_head : num_heads) {
-            for (auto head_size : head_sizes) {
-                std::cout << "num_token:" << num_token << ", num_head:" << num_head << ", head_size:" << head_size;
-                auto [val, gbps] = test::runbench<float>(num_token, num_head, head_size, rotary_dim, is_neox_style, eps);
-                std::cout << ", val:" << val << ", gbps:" << gbps << "\n";
+    for (auto is_neox_style : is_neox_styles) {
+        for (auto num_token : num_tokens) {
+            for (auto num_head : num_heads) {
+                for (auto head_size : head_sizes) {
+                    std::cout << "num_token:" << num_token << ", num_head:" << num_head << ", head_size:" << head_size << ", is_neox_style:" << is_neox_style;
+                    auto [val, gbps] = test::runbench<float>(num_token, num_head, head_size, head_size, is_neox_style, eps);
+                    std::cout << ", val:" << val << ", gbps:" << gbps << "\n";
+                }
             }
         }
     }

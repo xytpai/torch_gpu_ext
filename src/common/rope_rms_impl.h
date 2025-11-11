@@ -23,17 +23,37 @@ __inline__ __device__ T block_reduce_sum(T val, int pack_id, int pack_size) {
     const int tid = threadIdx.x;
     const int w_tid = tid % 32;
     const int wid = tid / 32;
-    val = warp_reduce_sum(val);
-    if (w_tid == 0) {
-        shared[wid] = val;
+    const int nw = blockDim.x / 32;
+    const int nw_packed = nw / pack_size;
+    const int wid_packed = wid % nw_packed;
+    const int blockdim_packed = blockDim.x / pack_size;
+
+    if (nw_packed <= 0) {
+        shared[threadIdx.x] = val;
+        __syncthreads();
+        int start = pack_id * blockdim_packed;
+        int end = start + blockdim_packed;
+        end = end < blockDim.x ? end : blockDim.x;
+        T acc = 0;
+        for (int i = start; i < end; ++i) {
+            acc += shared[i];
+        }
+        return acc;
+    } else {
+        val = warp_reduce_sum(val);
+        if (w_tid == 0) {
+            shared[wid] = val;
+        }
+        __syncthreads();
+        int w_start = pack_id * nw_packed;
+        int w_end = w_start + nw_packed;
+        w_end = w_end < nw ? w_end : nw;
+        T acc = 0;
+        for (int i = w_start; i < w_end; ++i) {
+            acc += shared[i];
+        }
+        return acc;
     }
-    __syncthreads();
-    int nw = blockDim.x / 32;
-    int nw_packed = nw / pack_size;
-    val = (w_tid < nw_packed) ? shared[wid * nw_packed + w_tid] : (T)(0.f);
-    __syncthreads();
-    val = warp_reduce_sum(val);
-    return val;
 }
 
 } // namespace block_utils
@@ -50,8 +70,20 @@ struct alignas(sizeof(T) * vec_size) vec_t {
     __device__ __forceinline__ void load(const T *ptr) {
         *this = *reinterpret_cast<vec_t<T, vec_size> *>(const_cast<T *>(ptr));
     }
+    __device__ __forceinline__ void loop_load(const T *ptr) {
+#pragma unroll
+        for (int i = 0; i < vec_size; ++i) {
+            data[i] = ptr[i];
+        }
+    }
     __device__ __forceinline__ void store(T *ptr) {
         *reinterpret_cast<vec_t<T, vec_size> *>(ptr) = *this;
+    }
+    __device__ __forceinline__ void loop_store(T *ptr) {
+#pragma unroll
+        for (int i = 0; i < vec_size; ++i) {
+            ptr[i] = data[i];
+        }
     }
     __device__ __forceinline__ void nontemporal_load(const T *ptr) {
         *reinterpret_cast<uint64_t *>(&data[0]) = __builtin_nontemporal_load((uint64_t *)(const_cast<T *>(ptr)));
@@ -69,61 +101,120 @@ struct alignas(sizeof(T) * vec_size) vec_t {
     }
 };
 
-template <typename T, int VEC_SIZE>
-__device__ __forceinline__ vec_t<T, VEC_SIZE> packed_rms_norm(
-    vec_t<T, VEC_SIZE> const &input,
-    vec_t<T, VEC_SIZE> const &gamma,
+template <typename T, int VEC_SIZE, int PACK>
+__device__ __forceinline__ void rms_norm_(
+    vec_t<T, VEC_SIZE> (&input)[PACK],
+    vec_t<T, VEC_SIZE> (&gamma)[PACK],
     float rms_dim,
     float rms_eps,
     int pack_id,
     int pack_size) {
-    __shared__ float s_val[32];
     vec_t<T, VEC_SIZE> norm_out;
     float acc = 0.f;
 #pragma unroll
-    for (int i = 0; i < VEC_SIZE; ++i) {
-        float v = static_cast<float>(reinterpret_cast<T const *>(&input)[i]);
-        acc += v * v;
+    for (int p = 0; p < PACK; ++p) {
+#pragma unroll
+        for (int i = 0; i < VEC_SIZE; ++i) {
+            float v = (float)input[p][i];
+            acc += v * v;
+        }
     }
     acc = block_utils::block_reduce_sum<float>(acc, pack_id, pack_size);
-    if (threadIdx.x % 32 == 0) {
-        s_val[threadIdx.x / 32] = rsqrtf(acc / rms_dim + rms_eps);
-    }
+    auto s_val = rsqrtf(acc / rms_dim + rms_eps);
     __syncthreads();
 #pragma unroll
-    for (int i = 0; i < VEC_SIZE; ++i) {
-        norm_out.data[i] =
-            static_cast<T>(static_cast<float>(reinterpret_cast<T const *>(&input)[i]) * s_val[pack_id] * static_cast<float>(reinterpret_cast<T const *>(&gamma)[i]));
+    for (int p = 0; p < PACK; ++p) {
+#pragma unroll
+        for (int i = 0; i < VEC_SIZE; ++i) {
+            input[p][i] = static_cast<T>((float)input[p][i] * s_val * (float)gamma[p][i]);
+        }
     }
-    return norm_out;
+}
+
+static constexpr int kBytesPerAccess = 16;
+
+template <typename T>
+__global__ void fused_rope_rms_neox_kernel(
+    const T *q, const T *k, const T *q_w, const T *k_w, const T *cos_sin,
+    T *out_q, T *out_k, int num_tokens, int num_heads, int head_size,
+    float eps) {
+    constexpr int VEC_SIZE = kBytesPerAccess / sizeof(T);
+    int numel = num_tokens * num_heads * head_size;
+    int half_head_size = head_size / 2;
+
+    int pack_size = (blockDim.x * VEC_SIZE) / half_head_size;
+    int pack_id = (threadIdx.x * VEC_SIZE) / half_head_size;
+    int global_head_id = blockIdx.x * pack_size + pack_id;
+    int token_id = global_head_id / num_heads;
+    int access_id_in_head = (threadIdx.x * VEC_SIZE) % half_head_size;
+
+    vec_t<T, VEC_SIZE> q_w_vec[2], k_w_vec[2];
+    q_w_vec[0].load(q_w + access_id_in_head);
+    q_w_vec[1].load(q_w + access_id_in_head + half_head_size);
+    k_w_vec[0].load(k_w + access_id_in_head);
+    k_w_vec[1].load(k_w + access_id_in_head + half_head_size);
+    for (int idx = global_head_id * head_size + access_id_in_head; idx < numel; idx += gridDim.x * pack_size * head_size) {
+        vec_t<T, VEC_SIZE> q_vec[2], k_vec[2], cos_vec, sin_vec;
+        q_vec[0].load(q + idx);
+        q_vec[1].load(q + idx + half_head_size);
+        k_vec[0].load(k + idx);
+        k_vec[1].load(k + idx + half_head_size);
+        cos_vec.load(&cos_sin[token_id * head_size + access_id_in_head]);
+        sin_vec.load(&cos_sin[token_id * head_size + access_id_in_head + half_head_size]);
+        rms_norm_<T, VEC_SIZE, 2>(q_vec, q_w_vec, head_size, eps, pack_id, pack_size);
+        rms_norm_<T, VEC_SIZE, 2>(k_vec, k_w_vec, head_size, eps, pack_id, pack_size);
+        vec_t<T, VEC_SIZE> oq_vec[2], ok_vec[2];
+#pragma unroll
+        for (int i = 0; i < VEC_SIZE; ++i) {
+            oq_vec[0][i] = q_vec[0][i] * cos_vec[i] - q_vec[1][i] * sin_vec[i];
+            oq_vec[1][i] = q_vec[1][i] * cos_vec[i] + q_vec[0][i] * sin_vec[i];
+            ok_vec[0][i] = k_vec[0][i] * cos_vec[i] - k_vec[1][i] * sin_vec[i];
+            ok_vec[1][i] = k_vec[1][i] * cos_vec[i] + k_vec[0][i] * sin_vec[i];
+        }
+        oq_vec[0].store(out_q + idx);
+        oq_vec[1].store(out_q + idx + half_head_size);
+        ok_vec[0].store(out_k + idx);
+        ok_vec[1].store(out_k + idx + half_head_size);
+    }
 }
 
 template <typename T>
-__global__ void fused_rope_rms_kernel(
+__global__ void fused_rope_rms_noneox_kernel(
     const T *q, const T *k, const T *q_w, const T *k_w, const T *cos_sin,
     T *out_q, T *out_k, int num_tokens, int num_heads, int head_size,
-    int rotary_dim, bool is_neox_style, float eps) {
-    constexpr int VEC_SIZE = 16 / sizeof(T);
+    float eps) {
+    constexpr int VEC_SIZE = kBytesPerAccess / sizeof(T);
+    int numel = num_tokens * num_heads * head_size;
+    int half_head_size = head_size / 2;
+
     int pack_size = (blockDim.x * VEC_SIZE) / head_size;
     int pack_id = (threadIdx.x * VEC_SIZE) / head_size;
     int global_head_id = blockIdx.x * pack_size + pack_id;
+    int token_id = global_head_id / num_heads;
     int access_id_in_head = (threadIdx.x * VEC_SIZE) % head_size;
-    // int seq_id = blockIdx.x / num_heads;
-    // int head_id = blockIdx.x % num_heads;
-    int numel = num_tokens * num_heads * head_size;
-    vec_t<T, VEC_SIZE> q_w_vec, k_w_vec;
-    q_w_vec.nontemporal_load(q_w + access_id_in_head);
-    k_w_vec.nontemporal_load(k_w + access_id_in_head);
+
+    vec_t<T, VEC_SIZE> q_w_vec[1], k_w_vec[1];
+    q_w_vec[0].load(q_w + access_id_in_head);
+    k_w_vec[0].load(k_w + access_id_in_head);
     for (int idx = global_head_id * head_size + access_id_in_head; idx < numel; idx += gridDim.x * pack_size * head_size) {
-        vec_t<T, VEC_SIZE> q_vec, k_vec;
-        q_vec.load(q + idx);
-        k_vec.load(k + idx);
-        auto q_rms_vec = packed_rms_norm(q_vec, q_w_vec, head_size, eps, pack_id, pack_size);
-        auto k_rms_vec = packed_rms_norm(k_vec, k_w_vec, head_size, eps, pack_id, pack_size);
-        if (access_id_in_head >= rotary_dim) {
-            q_rms_vec.store(out_q + idx);
-            k_rms_vec.store(out_k + idx);
+        vec_t<T, VEC_SIZE> q_vec[1], k_vec[1];
+        vec_t<T, VEC_SIZE / 2> cos_vec[1], sin_vec[1];
+        q_vec[0].load(q + idx);
+        k_vec[0].load(k + idx);
+        cos_vec[0].load(&cos_sin[token_id * head_size + access_id_in_head / 2]);
+        sin_vec[0].load(&cos_sin[token_id * head_size + access_id_in_head / 2 + half_head_size]);
+        rms_norm_<T, VEC_SIZE, 1>(q_vec, q_w_vec, head_size, eps, pack_id, pack_size);
+        rms_norm_<T, VEC_SIZE, 1>(k_vec, k_w_vec, head_size, eps, pack_id, pack_size);
+        vec_t<T, VEC_SIZE> oq_vec[2], ok_vec[2];
+#pragma unroll
+        for (int i = 0; i < VEC_SIZE / 2; ++i) {
+            oq_vec[0][2 * i + 0] = q_vec[0][2 * i + 0] * cos_vec[0][i] - q_vec[0][2 * i + 1] * sin_vec[0][i];
+            oq_vec[0][2 * i + 1] = q_vec[0][2 * i + 1] * cos_vec[0][i] + q_vec[0][2 * i + 0] * sin_vec[0][i];
+            ok_vec[0][2 * i + 0] = k_vec[0][2 * i + 0] * cos_vec[0][i] - k_vec[0][2 * i + 1] * sin_vec[0][i];
+            ok_vec[0][2 * i + 1] = k_vec[0][2 * i + 1] * cos_vec[0][i] + k_vec[0][2 * i + 0] * sin_vec[0][i];
         }
+        oq_vec[0].store(out_q + idx);
+        ok_vec[0].store(out_k + idx);
     }
 }
 
@@ -131,27 +222,37 @@ template <typename T>
 void fused_rope_rms(
     const T *q, const T *k, const T *q_w, const T *k_w, const T *cos_sin,
     T *out_q, T *out_k,
-    int num_tokens, int num_heads, int head_size, int rotary_dim,
+    int num_tokens, int num_heads, int head_size,
     bool is_neox_style, float eps, gpuStream_t stream) {
-    constexpr int VEC_SIZE = 16 / sizeof(T);
+    constexpr int VEC_SIZE = kBytesPerAccess / sizeof(T);
     assert(head_size % 32 == 0 && head_size >= 32);
     int pack_size;
     switch (head_size) {
+    case 256:
+        pack_size = 4;
+        break;
     case 128:
-        pack_size = 2;
+        pack_size = 8;
         break;
     case 64:
-        pack_size = 4;
+        pack_size = 16;
         break;
     default:
         pack_size = 1;
         break;
     }
-    dim3 threadsPerBlock(head_size / VEC_SIZE * pack_size);
-    dim3 numBlocks(num_tokens * num_heads / pack_size);
-    fused_rope_rms_kernel<T><<<numBlocks, threadsPerBlock, 0, stream>>>(
-        q, k, q_w, k_w, cos_sin, out_q, out_k, num_tokens, num_heads, head_size,
-        rotary_dim, is_neox_style, eps);
+    if (is_neox_style) {
+        dim3 threadsPerBlock(head_size / VEC_SIZE / 2 * pack_size);
+        dim3 numBlocks(num_tokens * num_heads / pack_size);
+        fused_rope_rms_neox_kernel<T><<<numBlocks, threadsPerBlock, 0, stream>>>(
+            q, k, q_w, k_w, cos_sin, out_q, out_k, num_tokens, num_heads, head_size, eps);
+    } else {
+        pack_size = pack_size == 1 ? 1 : pack_size / 2;
+        dim3 threadsPerBlock(head_size / VEC_SIZE * pack_size);
+        dim3 numBlocks(num_tokens * num_heads / pack_size);
+        fused_rope_rms_noneox_kernel<T><<<numBlocks, threadsPerBlock, 0, stream>>>(
+            q, k, q_w, k_w, cos_sin, out_q, out_k, num_tokens, num_heads, head_size, eps);
+    }
 }
 
 } // namespace rope_rms
