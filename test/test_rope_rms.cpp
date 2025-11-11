@@ -16,9 +16,9 @@ public:
     T *k;
     T *q_w;
     T *k_w;
+    T *cos_sin; // num_tokens, head_size
     T *out_q;
     T *out_k;
-    T *cos_sin; // num_tokens, head_size
 
     CPUInputs(int num_tokens, int num_heads, int head_size, int rotary_dim, bool is_neox_style, float eps) :
         num_tokens(num_tokens), num_heads(num_heads), head_size(head_size),
@@ -31,9 +31,9 @@ public:
         k = new T[numel];
         q_w = new T[head_size];
         k_w = new T[head_size];
+        cos_sin = new T[num_tokens * head_size];
         out_q = new T[numel];
         out_k = new T[numel];
-        cos_sin = new T[num_tokens * head_size];
     }
 
     void reset() {
@@ -57,9 +57,9 @@ public:
         delete[] k;
         delete[] q_w;
         delete[] k_w;
+        delete[] cos_sin;
         delete[] out_q;
         delete[] out_k;
-        delete[] cos_sin;
     }
 
     void operator()() {
@@ -115,17 +115,21 @@ public:
     int num_tokens;
     int num_heads;
     int head_size;
-    int numel;
+    int rotary_dim;
+    bool is_neox_style;
     float eps;
+    int numel;
     T *q;
     T *k;
     T *q_w;
     T *k_w;
+    T *cos_sin;
     T *out_q;
     T *out_k;
 
-    GPUInputs(int num_tokens, int num_heads, int head_size, float eps) :
-        num_tokens(num_tokens), num_heads(num_heads), head_size(head_size), eps(eps) {
+    GPUInputs(int num_tokens, int num_heads, int head_size, int rotary_dim, bool is_neox_style, float eps) :
+        num_tokens(num_tokens), num_heads(num_heads), head_size(head_size),
+        rotary_dim(rotary_dim), is_neox_style(is_neox_style), eps(eps) {
         numel = num_tokens * num_heads * head_size;
     }
 
@@ -134,6 +138,7 @@ public:
         gpuMalloc(&k, numel * sizeof(T));
         gpuMalloc(&q_w, head_size * sizeof(T));
         gpuMalloc(&k_w, head_size * sizeof(T));
+        gpuMalloc(&cos_sin, num_tokens * head_size * sizeof(T));
         gpuMalloc(&out_q, numel * sizeof(T));
         gpuMalloc(&out_k, numel * sizeof(T));
         gpuDeviceSynchronize();
@@ -144,6 +149,7 @@ public:
         gpuMemcpy(k, inputs.k, numel * sizeof(T), gpuMemcpyHostToDevice);
         gpuMemcpy(q_w, inputs.q_w, head_size * sizeof(T), gpuMemcpyHostToDevice);
         gpuMemcpy(k_w, inputs.k_w, head_size * sizeof(T), gpuMemcpyHostToDevice);
+        gpuMemcpy(cos_sin, inputs.cos_sin, num_tokens * head_size * sizeof(T), gpuMemcpyHostToDevice);
         gpuDeviceSynchronize();
     }
 
@@ -152,6 +158,7 @@ public:
         gpuFree(k);
         gpuFree(q_w);
         gpuFree(k_w);
+        gpuFree(cos_sin);
         gpuFree(out_q);
         gpuFree(out_k);
         gpuDeviceSynchronize();
@@ -163,7 +170,8 @@ public:
         gpuEventCreate(&stop);
         gpuEventRecord(start);
 
-        rope_rms::fused_rope_rms(q, k, q_w, k_w, out_q, out_k, num_tokens, num_heads, head_size, eps, 0);
+        rope_rms::fused_rope_rms(q, k, q_w, k_w, cos_sin, out_q, out_k, num_tokens, num_heads, head_size,
+                                 rotary_dim, is_neox_style, eps, 0);
         gpuDeviceSynchronize();
 
         gpuEventRecord(stop);
@@ -214,7 +222,7 @@ std::tuple<bool, float> runbench(
     float eps,
     float atol = 0.0001) {
     CPUInputs<T> cpu_inputs(num_tokens, num_heads, head_size, rotary_dim, eps, is_neox_style);
-    GPUInputs<T> gpu_inputs(num_tokens, num_heads, head_size, eps);
+    GPUInputs<T> gpu_inputs(num_tokens, num_heads, head_size, rotary_dim, eps, is_neox_style);
     cpu_inputs.allocate();
     gpu_inputs.allocate();
     cpu_inputs.reset();

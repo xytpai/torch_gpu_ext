@@ -99,35 +99,44 @@ __device__ __forceinline__ vec_t<T, VEC_SIZE> packed_rms_norm(
 }
 
 template <typename T>
-__global__ void fused_rope_rms_kernel(const T *q, const T *k, const T *q_w, const T *k_w, T *out_q, T *out_k, int seq_len, int num_heads, int head_dim, float eps) {
+__global__ void fused_rope_rms_kernel(
+    const T *q, const T *k, const T *q_w, const T *k_w, const T *cos_sin,
+    T *out_q, T *out_k, int num_tokens, int num_heads, int head_size,
+    int rotary_dim, bool is_neox_style, float eps) {
     constexpr int VEC_SIZE = 16 / sizeof(T);
-    int pack_size = (blockDim.x * VEC_SIZE) / head_dim;
-    int pack_id = (threadIdx.x * VEC_SIZE) / head_dim;
+    int pack_size = (blockDim.x * VEC_SIZE) / head_size;
+    int pack_id = (threadIdx.x * VEC_SIZE) / head_size;
     int global_head_id = blockIdx.x * pack_size + pack_id;
-    int access_id_in_head = (threadIdx.x * VEC_SIZE) % head_dim;
+    int access_id_in_head = (threadIdx.x * VEC_SIZE) % head_size;
     // int seq_id = blockIdx.x / num_heads;
     // int head_id = blockIdx.x % num_heads;
-    int numel = seq_len * num_heads * head_dim;
+    int numel = num_tokens * num_heads * head_size;
     vec_t<T, VEC_SIZE> q_w_vec, k_w_vec;
     q_w_vec.nontemporal_load(q_w + access_id_in_head);
     k_w_vec.nontemporal_load(k_w + access_id_in_head);
-    for (int idx = global_head_id * head_dim + access_id_in_head; idx < numel; idx += gridDim.x * pack_size * head_dim) {
+    for (int idx = global_head_id * head_size + access_id_in_head; idx < numel; idx += gridDim.x * pack_size * head_size) {
         vec_t<T, VEC_SIZE> q_vec, k_vec;
         q_vec.load(q + idx);
         k_vec.load(k + idx);
-        auto q_rms_vec = packed_rms_norm(q_vec, q_w_vec, head_dim, eps, pack_id, pack_size);
-        auto k_rms_vec = packed_rms_norm(k_vec, k_w_vec, head_dim, eps, pack_id, pack_size);
-        q_rms_vec.store(out_q + idx);
-        k_rms_vec.store(out_k + idx);
+        auto q_rms_vec = packed_rms_norm(q_vec, q_w_vec, head_size, eps, pack_id, pack_size);
+        auto k_rms_vec = packed_rms_norm(k_vec, k_w_vec, head_size, eps, pack_id, pack_size);
+        if (access_id_in_head >= rotary_dim) {
+            q_rms_vec.store(out_q + idx);
+            k_rms_vec.store(out_k + idx);
+        }
     }
 }
 
 template <typename T>
-void fused_rope_rms(const T *q, const T *k, const T *q_w, const T *k_w, T *out_q, T *out_k, int seq_len, int num_heads, int head_dim, float eps, gpuStream_t stream) {
+void fused_rope_rms(
+    const T *q, const T *k, const T *q_w, const T *k_w, const T *cos_sin,
+    T *out_q, T *out_k,
+    int num_tokens, int num_heads, int head_size, int rotary_dim,
+    bool is_neox_style, float eps, gpuStream_t stream) {
     constexpr int VEC_SIZE = 16 / sizeof(T);
-    assert(head_dim % 32 == 0 && head_dim >= 32);
+    assert(head_size % 32 == 0 && head_size >= 32);
     int pack_size;
-    switch (head_dim) {
+    switch (head_size) {
     case 128:
         pack_size = 2;
         break;
@@ -138,9 +147,11 @@ void fused_rope_rms(const T *q, const T *k, const T *q_w, const T *k_w, T *out_q
         pack_size = 1;
         break;
     }
-    dim3 threadsPerBlock(head_dim / VEC_SIZE * pack_size);
-    dim3 numBlocks(seq_len * num_heads / pack_size);
-    fused_rope_rms_kernel<T><<<numBlocks, threadsPerBlock, 0, stream>>>(q, k, q_w, k_w, out_q, out_k, seq_len, num_heads, head_dim, eps);
+    dim3 threadsPerBlock(head_size / VEC_SIZE * pack_size);
+    dim3 numBlocks(num_tokens * num_heads / pack_size);
+    fused_rope_rms_kernel<T><<<numBlocks, threadsPerBlock, 0, stream>>>(
+        q, k, q_w, k_w, cos_sin, out_q, out_k, num_tokens, num_heads, head_size,
+        rotary_dim, is_neox_style, eps);
 }
 
 } // namespace rope_rms
