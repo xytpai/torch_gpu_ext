@@ -5,30 +5,35 @@ namespace test {
 template <typename T>
 class CPUInputs {
 public:
-    int seq_len;
+    int num_tokens;
     int num_heads;
-    int head_dim;
-    int numel;
+    int head_size;
+    int rotary_dim;
+    bool is_neox_style;
     float eps;
+    int numel;
     T *q;
     T *k;
     T *q_w;
     T *k_w;
     T *out_q;
     T *out_k;
+    T *cos_sin; // num_tokens, head_size
 
-    CPUInputs(int seq_len, int num_heads, int head_dim, float eps) :
-        seq_len(seq_len), num_heads(num_heads), head_dim(head_dim), eps(eps) {
-        numel = seq_len * num_heads * head_dim;
+    CPUInputs(int num_tokens, int num_heads, int head_size, int rotary_dim, bool is_neox_style, float eps) :
+        num_tokens(num_tokens), num_heads(num_heads), head_size(head_size),
+        rotary_dim(rotary_dim), is_neox_style(is_neox_style), eps(eps) {
+        numel = num_tokens * num_heads * head_size;
     }
 
     void allocate() {
         q = new T[numel];
         k = new T[numel];
-        q_w = new T[head_dim];
-        k_w = new T[head_dim];
+        q_w = new T[head_size];
+        k_w = new T[head_size];
         out_q = new T[numel];
         out_k = new T[numel];
+        cos_sin = new T[num_tokens * head_size];
     }
 
     void reset() {
@@ -38,9 +43,12 @@ public:
             out_q[i] = 2.f * ((rand() / (float)INT_MAX) - 0.5f);
             out_k[i] = 2.f * ((rand() / (float)INT_MAX) - 0.5f);
         }
-        for (int i = 0; i < head_dim; ++i) {
+        for (int i = 0; i < head_size; ++i) {
             q_w[i] = 2.f * ((rand() / (float)INT_MAX) - 0.5f);
             k_w[i] = 2.f * ((rand() / (float)INT_MAX) - 0.5f);
+        }
+        for (int i = 0; i < num_tokens * head_size; ++i) {
+            cos_sin[i] = 2.f * ((rand() / (float)INT_MAX) - 0.5f);
         }
     }
 
@@ -51,25 +59,50 @@ public:
         delete[] k_w;
         delete[] out_q;
         delete[] out_k;
+        delete[] cos_sin;
     }
 
     void operator()() {
-        for (int sid = 0; sid < seq_len; sid++) {
+        for (int tid = 0; tid < num_tokens; tid++) {
             for (int hid = 0; hid < num_heads; hid++) {
                 double x2_q = 0;
                 double x2_k = 0;
-                int offset = (sid * num_heads + hid) * head_dim;
-                for (int h = 0; h < head_dim; ++h) {
+                int offset = (tid * num_heads + hid) * head_size;
+                for (int h = 0; h < head_size; ++h) {
                     auto q_data = q[offset + h];
                     auto k_data = k[offset + h];
                     x2_q += q_data * q_data;
                     x2_k += k_data * k_data;
                 }
-                double beta_q = (double)1.0 / std::sqrt(x2_q / head_dim + eps);
-                double beta_k = (double)1.0 / std::sqrt(x2_k / head_dim + eps);
-                for (int h = 0; h < head_dim; ++h) {
+                double beta_q = (double)1.0 / std::sqrt(x2_q / head_size + eps);
+                double beta_k = (double)1.0 / std::sqrt(x2_k / head_size + eps);
+                for (int h = rotary_dim; h < head_size; ++h) {
                     out_q[offset + h] = q[offset + h] * beta_q * q_w[h];
                     out_k[offset + h] = k[offset + h] * beta_k * k_w[h];
+                }
+                int half_rotary_dim = rotary_dim / 2;
+                for (int h = 0; h < half_rotary_dim; ++h) {
+                    auto cos = cos_sin[tid * head_size + h];
+                    auto sin = cos_sin[tid * head_size + h];
+                    if (is_neox_style) {
+                        auto q1 = q[offset + h] * beta_q * q_w[h];
+                        auto k1 = k[offset + h] * beta_k * k_w[h];
+                        auto q2 = q[offset + h + half_rotary_dim] * beta_q * q_w[h + half_rotary_dim];
+                        auto k2 = k[offset + h + half_rotary_dim] * beta_k * k_w[h + half_rotary_dim];
+                        out_q[offset + h] = q1 * cos - q2 * sin;
+                        out_q[offset + h + half_rotary_dim] = q2 * cos + q1 * sin;
+                        out_k[offset + h] = k1 * cos - k2 * sin;
+                        out_k[offset + h + half_rotary_dim] = k2 * cos + k1 * sin;
+                    } else {
+                        auto q1 = q[offset + h * 2 + 0] * beta_q * q_w[h * 2 + 0];
+                        auto k1 = k[offset + h * 2 + 0] * beta_k * k_w[h * 2 + 0];
+                        auto q2 = q[offset + h * 2 + 1] * beta_q * q_w[h * 2 + 1];
+                        auto k2 = k[offset + h * 2 + 1] * beta_k * k_w[h * 2 + 1];
+                        out_q[offset + h * 2 + 0] = q1 * cos - q2 * sin;
+                        out_q[offset + h * 2 + 1] = q2 * cos + q1 * sin;
+                        out_k[offset + h * 2 + 0] = k1 * cos - k2 * sin;
+                        out_k[offset + h * 2 + 1] = k2 * cos + k1 * sin;
+                    }
                 }
             }
         }
@@ -79,9 +112,9 @@ public:
 template <typename T>
 class GPUInputs {
 public:
-    int seq_len;
+    int num_tokens;
     int num_heads;
-    int head_dim;
+    int head_size;
     int numel;
     float eps;
     T *q;
@@ -91,16 +124,16 @@ public:
     T *out_q;
     T *out_k;
 
-    GPUInputs(int seq_len, int num_heads, int head_dim, float eps) :
-        seq_len(seq_len), num_heads(num_heads), head_dim(head_dim), eps(eps) {
-        numel = seq_len * num_heads * head_dim;
+    GPUInputs(int num_tokens, int num_heads, int head_size, float eps) :
+        num_tokens(num_tokens), num_heads(num_heads), head_size(head_size), eps(eps) {
+        numel = num_tokens * num_heads * head_size;
     }
 
     void allocate() {
         gpuMalloc(&q, numel * sizeof(T));
         gpuMalloc(&k, numel * sizeof(T));
-        gpuMalloc(&q_w, head_dim * sizeof(T));
-        gpuMalloc(&k_w, head_dim * sizeof(T));
+        gpuMalloc(&q_w, head_size * sizeof(T));
+        gpuMalloc(&k_w, head_size * sizeof(T));
         gpuMalloc(&out_q, numel * sizeof(T));
         gpuMalloc(&out_k, numel * sizeof(T));
         gpuDeviceSynchronize();
@@ -109,8 +142,8 @@ public:
     void reset(CPUInputs<T> &inputs) {
         gpuMemcpy(q, inputs.q, numel * sizeof(T), gpuMemcpyHostToDevice);
         gpuMemcpy(k, inputs.k, numel * sizeof(T), gpuMemcpyHostToDevice);
-        gpuMemcpy(q_w, inputs.q_w, head_dim * sizeof(T), gpuMemcpyHostToDevice);
-        gpuMemcpy(k_w, inputs.k_w, head_dim * sizeof(T), gpuMemcpyHostToDevice);
+        gpuMemcpy(q_w, inputs.q_w, head_size * sizeof(T), gpuMemcpyHostToDevice);
+        gpuMemcpy(k_w, inputs.k_w, head_size * sizeof(T), gpuMemcpyHostToDevice);
         gpuDeviceSynchronize();
     }
 
@@ -130,14 +163,14 @@ public:
         gpuEventCreate(&stop);
         gpuEventRecord(start);
 
-        rope_rms::fused_rope_rms(q, k, q_w, k_w, out_q, out_k, seq_len, num_heads, head_dim, eps, 0);
+        rope_rms::fused_rope_rms(q, k, q_w, k_w, out_q, out_k, num_tokens, num_heads, head_size, eps, 0);
         gpuDeviceSynchronize();
 
         gpuEventRecord(stop);
         gpuEventSynchronize(stop);
         float ms = 0;
         gpuEventElapsedTime(&ms, start, stop);
-        float input_bytes = (numel + head_dim) * 2 * sizeof(T);
+        float input_bytes = (numel + head_size) * 2 * sizeof(T);
         float output_bytes = numel * 2 * sizeof(T);
         float gbps = (input_bytes + output_bytes) / 1000.0 / 1000.0 / ms;
         return gbps;
@@ -172,9 +205,16 @@ public:
 };
 
 template <typename T>
-std::tuple<bool, float> runbench(int seq_len, int num_heads, int head_dim, float eps = 1e-6, float atol = 0.0001) {
-    CPUInputs<T> cpu_inputs(seq_len, num_heads, head_dim, eps);
-    GPUInputs<T> gpu_inputs(seq_len, num_heads, head_dim, eps);
+std::tuple<bool, float> runbench(
+    int num_tokens,
+    int num_heads,
+    int head_size,
+    int rotary_dim,
+    bool is_neox_style,
+    float eps,
+    float atol = 0.0001) {
+    CPUInputs<T> cpu_inputs(num_tokens, num_heads, head_size, rotary_dim, eps, is_neox_style);
+    GPUInputs<T> gpu_inputs(num_tokens, num_heads, head_size, eps);
     cpu_inputs.allocate();
     gpu_inputs.allocate();
     cpu_inputs.reset();
@@ -188,14 +228,17 @@ std::tuple<bool, float> runbench(int seq_len, int num_heads, int head_dim, float
 } // namespace test
 
 int main() {
-    std::vector<int> seq_lens = {513, 1257, 127, 778, 10024, 3};
+    std::vector<int> num_tokens = {513, 1257, 127, 778, 10024, 3};
     std::vector<int> num_heads = {32, 64};
-    std::vector<int> head_dims = {128, 256};
-    for (auto seq_len : seq_lens) {
+    std::vector<int> head_sizes = {128, 256};
+    int rotary_dim = 128;
+    bool is_neox_style = true;
+    float eps = 1e-6;
+    for (auto num_token : num_tokens) {
         for (auto num_head : num_heads) {
-            for (auto head_dim : head_dims) {
-                std::cout << "seq_len:" << seq_len << ", num_head:" << num_head << ", head_dim:" << head_dim;
-                auto [val, gbps] = test::runbench<float>(seq_len, num_head, head_dim);
+            for (auto head_size : head_sizes) {
+                std::cout << "num_token:" << num_token << ", num_head:" << num_head << ", head_size:" << head_size;
+                auto [val, gbps] = test::runbench<float>(num_token, num_head, head_size, rotary_dim, is_neox_style, eps);
                 std::cout << ", val:" << val << ", gbps:" << gbps << "\n";
             }
         }
