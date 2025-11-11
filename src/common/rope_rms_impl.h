@@ -135,7 +135,7 @@ static constexpr int kBytesPerAccess = 16;
 
 template <typename T>
 __global__ void fused_rope_rms_neox_kernel(
-    const T *q, const T *k, const T *q_w, const T *k_w, const T *cos_sin,
+    const T *q, const T *k, const T *q_w, const T *k_w, const T *cos, const T *sin,
     T *out_q, T *out_k, int num_tokens, int num_heads, int head_size,
     float eps) {
     constexpr int VEC_SIZE = kBytesPerAccess / sizeof(T);
@@ -159,8 +159,8 @@ __global__ void fused_rope_rms_neox_kernel(
         q_vec[1].load(q + idx + half_head_size);
         k_vec[0].load(k + idx);
         k_vec[1].load(k + idx + half_head_size);
-        cos_vec.load(&cos_sin[token_id * head_size + access_id_in_head]);
-        sin_vec.load(&cos_sin[token_id * head_size + access_id_in_head + half_head_size]);
+        cos_vec.load(&cos[token_id * head_size / 2 + access_id_in_head]);
+        sin_vec.load(&sin[token_id * head_size / 2 + access_id_in_head]);
         rms_norm_<T, VEC_SIZE, 2>(q_vec, q_w_vec, head_size, eps, pack_id, pack_size);
         rms_norm_<T, VEC_SIZE, 2>(k_vec, k_w_vec, head_size, eps, pack_id, pack_size);
         vec_t<T, VEC_SIZE> oq_vec[2], ok_vec[2];
@@ -180,7 +180,7 @@ __global__ void fused_rope_rms_neox_kernel(
 
 template <typename T>
 __global__ void fused_rope_rms_noneox_kernel(
-    const T *q, const T *k, const T *q_w, const T *k_w, const T *cos_sin,
+    const T *q, const T *k, const T *q_w, const T *k_w, const T *cos, const T *sin,
     T *out_q, T *out_k, int num_tokens, int num_heads, int head_size,
     float eps) {
     constexpr int VEC_SIZE = kBytesPerAccess / sizeof(T);
@@ -201,8 +201,8 @@ __global__ void fused_rope_rms_noneox_kernel(
         vec_t<T, VEC_SIZE / 2> cos_vec[1], sin_vec[1];
         q_vec[0].load(q + idx);
         k_vec[0].load(k + idx);
-        cos_vec[0].load(&cos_sin[token_id * head_size + access_id_in_head / 2]);
-        sin_vec[0].load(&cos_sin[token_id * head_size + access_id_in_head / 2 + half_head_size]);
+        cos_vec[0].load(&cos[token_id * head_size / 2 + access_id_in_head / 2]);
+        sin_vec[0].load(&sin[token_id * head_size / 2 + access_id_in_head / 2]);
         rms_norm_<T, VEC_SIZE, 1>(q_vec, q_w_vec, head_size, eps, pack_id, pack_size);
         rms_norm_<T, VEC_SIZE, 1>(k_vec, k_w_vec, head_size, eps, pack_id, pack_size);
         vec_t<T, VEC_SIZE> oq_vec[2], ok_vec[2];
@@ -220,7 +220,7 @@ __global__ void fused_rope_rms_noneox_kernel(
 
 template <typename T>
 void fused_rope_rms(
-    const T *q, const T *k, const T *q_w, const T *k_w, const T *cos_sin,
+    const T *q, const T *k, const T *q_w, const T *k_w, const T *cos, const T *sin,
     T *out_q, T *out_k,
     int num_tokens, int num_heads, int head_size,
     bool is_neox_style, float eps, gpuStream_t stream) {
@@ -245,13 +245,13 @@ void fused_rope_rms(
         dim3 threadsPerBlock(head_size / VEC_SIZE / 2 * pack_size);
         dim3 numBlocks(num_tokens * num_heads / pack_size);
         fused_rope_rms_neox_kernel<T><<<numBlocks, threadsPerBlock, 0, stream>>>(
-            q, k, q_w, k_w, cos_sin, out_q, out_k, num_tokens, num_heads, head_size, eps);
+            q, k, q_w, k_w, cos, sin, out_q, out_k, num_tokens, num_heads, head_size, eps);
     } else {
         pack_size = pack_size == 1 ? 1 : pack_size / 2;
         dim3 threadsPerBlock(head_size / VEC_SIZE * pack_size);
         dim3 numBlocks(num_tokens * num_heads / pack_size);
         fused_rope_rms_noneox_kernel<T><<<numBlocks, threadsPerBlock, 0, stream>>>(
-            q, k, q_w, k_w, cos_sin, out_q, out_k, num_tokens, num_heads, head_size, eps);
+            q, k, q_w, k_w, cos, sin, out_q, out_k, num_tokens, num_heads, head_size, eps);
     }
 }
 

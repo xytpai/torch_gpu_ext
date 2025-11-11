@@ -16,7 +16,8 @@ public:
     T *k;
     T *q_w;
     T *k_w;
-    T *cos_sin; // num_tokens, head_size
+    T *cos; // num_tokens, head_size/2
+    T *sin;
     T *out_q;
     T *out_k;
 
@@ -31,7 +32,8 @@ public:
         k = new T[numel];
         q_w = new T[head_size];
         k_w = new T[head_size];
-        cos_sin = new T[num_tokens * head_size];
+        cos = new T[num_tokens * head_size / 2];
+        sin = new T[num_tokens * head_size / 2];
         out_q = new T[numel];
         out_k = new T[numel];
     }
@@ -47,8 +49,9 @@ public:
             q_w[i] = 2.f * ((rand() / (float)INT_MAX) - 0.5f);
             k_w[i] = 2.f * ((rand() / (float)INT_MAX) - 0.5f);
         }
-        for (int i = 0; i < num_tokens * head_size; ++i) {
-            cos_sin[i] = 2.f * ((rand() / (float)INT_MAX) - 0.5f);
+        for (int i = 0; i < num_tokens * head_size / 2; ++i) {
+            cos[i] = 2.f * ((rand() / (float)INT_MAX) - 0.5f);
+            sin[i] = 2.f * ((rand() / (float)INT_MAX) - 0.5f);
         }
     }
 
@@ -57,7 +60,8 @@ public:
         delete[] k;
         delete[] q_w;
         delete[] k_w;
-        delete[] cos_sin;
+        delete[] cos;
+        delete[] sin;
         delete[] out_q;
         delete[] out_k;
     }
@@ -82,26 +86,26 @@ public:
                 }
                 int half_rotary_dim = rotary_dim / 2;
                 for (int h = 0; h < half_rotary_dim; ++h) {
-                    auto cos = cos_sin[tid * head_size + h];
-                    auto sin = cos_sin[tid * head_size + h + half_rotary_dim];
+                    auto cos_ = cos[tid * head_size / 2 + h];
+                    auto sin_ = sin[tid * head_size / 2 + h];
                     if (is_neox_style) {
                         auto q1 = q[offset + h] * beta_q * q_w[h];
                         auto k1 = k[offset + h] * beta_k * k_w[h];
                         auto q2 = q[offset + h + half_rotary_dim] * beta_q * q_w[h + half_rotary_dim];
                         auto k2 = k[offset + h + half_rotary_dim] * beta_k * k_w[h + half_rotary_dim];
-                        out_q[offset + h] = q1 * cos - q2 * sin;
-                        out_q[offset + h + half_rotary_dim] = q2 * cos + q1 * sin;
-                        out_k[offset + h] = k1 * cos - k2 * sin;
-                        out_k[offset + h + half_rotary_dim] = k2 * cos + k1 * sin;
+                        out_q[offset + h] = q1 * cos_ - q2 * sin_;
+                        out_q[offset + h + half_rotary_dim] = q2 * cos_ + q1 * sin_;
+                        out_k[offset + h] = k1 * cos_ - k2 * sin_;
+                        out_k[offset + h + half_rotary_dim] = k2 * cos_ + k1 * sin_;
                     } else {
                         auto q1 = q[offset + h * 2 + 0] * beta_q * q_w[h * 2 + 0];
                         auto k1 = k[offset + h * 2 + 0] * beta_k * k_w[h * 2 + 0];
                         auto q2 = q[offset + h * 2 + 1] * beta_q * q_w[h * 2 + 1];
                         auto k2 = k[offset + h * 2 + 1] * beta_k * k_w[h * 2 + 1];
-                        out_q[offset + h * 2 + 0] = q1 * cos - q2 * sin;
-                        out_q[offset + h * 2 + 1] = q2 * cos + q1 * sin;
-                        out_k[offset + h * 2 + 0] = k1 * cos - k2 * sin;
-                        out_k[offset + h * 2 + 1] = k2 * cos + k1 * sin;
+                        out_q[offset + h * 2 + 0] = q1 * cos_ - q2 * sin_;
+                        out_q[offset + h * 2 + 1] = q2 * cos_ + q1 * sin_;
+                        out_k[offset + h * 2 + 0] = k1 * cos_ - k2 * sin_;
+                        out_k[offset + h * 2 + 1] = k2 * cos_ + k1 * sin_;
                     }
                 }
             }
@@ -123,7 +127,8 @@ public:
     T *k;
     T *q_w;
     T *k_w;
-    T *cos_sin;
+    T *cos;
+    T *sin;
     T *out_q;
     T *out_k;
 
@@ -138,7 +143,8 @@ public:
         gpuMalloc(&k, numel * sizeof(T));
         gpuMalloc(&q_w, head_size * sizeof(T));
         gpuMalloc(&k_w, head_size * sizeof(T));
-        gpuMalloc(&cos_sin, num_tokens * head_size * sizeof(T));
+        gpuMalloc(&cos, num_tokens * head_size / 2 * sizeof(T));
+        gpuMalloc(&sin, num_tokens * head_size / 2 * sizeof(T));
         gpuMalloc(&out_q, numel * sizeof(T));
         gpuMalloc(&out_k, numel * sizeof(T));
         gpuDeviceSynchronize();
@@ -149,7 +155,8 @@ public:
         gpuMemcpy(k, inputs.k, numel * sizeof(T), gpuMemcpyHostToDevice);
         gpuMemcpy(q_w, inputs.q_w, head_size * sizeof(T), gpuMemcpyHostToDevice);
         gpuMemcpy(k_w, inputs.k_w, head_size * sizeof(T), gpuMemcpyHostToDevice);
-        gpuMemcpy(cos_sin, inputs.cos_sin, num_tokens * head_size * sizeof(T), gpuMemcpyHostToDevice);
+        gpuMemcpy(cos, inputs.cos, num_tokens * head_size / 2 * sizeof(T), gpuMemcpyHostToDevice);
+        gpuMemcpy(sin, inputs.sin, num_tokens * head_size / 2 * sizeof(T), gpuMemcpyHostToDevice);
         gpuDeviceSynchronize();
     }
 
@@ -158,7 +165,8 @@ public:
         gpuFree(k);
         gpuFree(q_w);
         gpuFree(k_w);
-        gpuFree(cos_sin);
+        gpuFree(cos);
+        gpuFree(sin);
         gpuFree(out_q);
         gpuFree(out_k);
         gpuDeviceSynchronize();
@@ -171,7 +179,7 @@ public:
         gpuEventRecord(start);
 
         assert(head_size == rotary_dim);
-        rope_rms::fused_rope_rms(q, k, q_w, k_w, cos_sin, out_q, out_k, num_tokens, num_heads, head_size, is_neox_style, eps, 0);
+        rope_rms::fused_rope_rms(q, k, q_w, k_w, cos, sin, out_q, out_k, num_tokens, num_heads, head_size, is_neox_style, eps, 0);
         gpuDeviceSynchronize();
 
         gpuEventRecord(stop);
