@@ -28,6 +28,11 @@ def test_gpu_mul():
     assert torch.allclose(ref_ab, out_ab)
 
 
+def test_rope_rms():
+    torch_gpu_ext.fused_rope_rms
+
+
 if __name__ == "__main__":
     test_gpu_add()
     test_gpu_mul()
+    test_rope_rms()

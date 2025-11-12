@@ -24,6 +24,7 @@ PyObject *PyInit__C(void) {
 TORCH_LIBRARY(torch_gpu_ext, m) {
     m.def("gpu_add(Tensor a, Tensor b, Tensor out) -> ()");
     m.def("gpu_mul(Tensor a, Tensor b, Tensor out) -> ()");
+    m.def("fused_rope_rms(Tensor qkv, Tensor qw, Tensor kw, Tensor cos_sin, Tensor positions, SymInt num_tokens, SymInt num_heads_q, SymInt num_heads_k, SymInt num_heads_v, SymInt head_size, bool is_neox_style, float eps) -> ()");
     m.class_<MyObject>("MyObject")
         .def(torch::init<int64_t>())
         .def("value", &MyObject::value);
@@ -32,4 +33,5 @@ TORCH_LIBRARY(torch_gpu_ext, m) {
 TORCH_LIBRARY_IMPL(torch_gpu_ext, CUDA, m) {
     m.impl("gpu_add", &gpu_add);
     m.impl("gpu_mul", &gpu_mul);
+    m.impl("fused_rope_rms", &fused_rope_rms);
 }

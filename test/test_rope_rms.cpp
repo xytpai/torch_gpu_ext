@@ -4,171 +4,167 @@ namespace test {
 
 template <typename T>
 class CPUInputs {
+    int64_t num_heads_;
+
 public:
-    int num_tokens;
-    int num_heads;
-    int head_size;
-    int rotary_dim;
+    int64_t num_tokens;
+    int64_t num_heads_q;
+    int64_t num_heads_k;
+    int64_t num_heads_v;
+    int64_t head_size;
     bool is_neox_style;
-    float eps;
-    int numel;
-    T *q;
-    T *k;
+    double eps;
+    int64_t max_positions;
+    T *qkv;
     T *q_w;
     T *k_w;
-    T *cos; // num_tokens, head_size/2
-    T *sin;
-    T *out_q;
-    T *out_k;
+    T *cos_sin;         // max_positions, head_size
+    int64_t *positions; // num_tokens
 
-    CPUInputs(int num_tokens, int num_heads, int head_size, int rotary_dim, bool is_neox_style, float eps) :
-        num_tokens(num_tokens), num_heads(num_heads), head_size(head_size),
-        rotary_dim(rotary_dim), is_neox_style(is_neox_style), eps(eps) {
-        numel = num_tokens * num_heads * head_size;
+    CPUInputs(
+        int64_t num_tokens,
+        int64_t num_heads_q,
+        int64_t num_heads_k,
+        int64_t num_heads_v,
+        int64_t head_size,
+        bool is_neox_style,
+        double eps,
+        int64_t max_positions) :
+        num_tokens(num_tokens),
+        num_heads_q(num_heads_q), num_heads_k(num_heads_k), num_heads_v(num_heads_v),
+        head_size(head_size), is_neox_style(is_neox_style), eps(eps), max_positions(max_positions) {
+        num_heads_ = num_heads_q + num_heads_k + num_heads_v;
     }
 
     void allocate() {
-        q = new T[numel];
-        k = new T[numel];
+        qkv = new T[num_tokens * num_heads_ * head_size];
         q_w = new T[head_size];
         k_w = new T[head_size];
-        cos = new T[num_tokens * head_size / 2];
-        sin = new T[num_tokens * head_size / 2];
-        out_q = new T[numel];
-        out_k = new T[numel];
+        cos_sin = new T[max_positions * head_size];
+        positions = new int64_t[num_tokens];
     }
 
     void reset() {
-        for (int i = 0; i < numel; ++i) {
-            q[i] = 2.f * ((rand() / (float)INT_MAX) - 0.5f);
-            k[i] = 2.f * ((rand() / (float)INT_MAX) - 0.5f);
-            out_q[i] = 2.f * ((rand() / (float)INT_MAX) - 0.5f);
-            out_k[i] = 2.f * ((rand() / (float)INT_MAX) - 0.5f);
+        for (int i = 0; i < num_tokens * num_heads_ * head_size; ++i) {
+            qkv[i] = 2.f * ((rand() / (float)INT_MAX) - 0.5f);
         }
         for (int i = 0; i < head_size; ++i) {
             q_w[i] = 2.f * ((rand() / (float)INT_MAX) - 0.5f);
             k_w[i] = 2.f * ((rand() / (float)INT_MAX) - 0.5f);
         }
-        for (int i = 0; i < num_tokens * head_size / 2; ++i) {
-            cos[i] = 2.f * ((rand() / (float)INT_MAX) - 0.5f);
-            sin[i] = 2.f * ((rand() / (float)INT_MAX) - 0.5f);
+        for (int i = 0; i < max_positions * head_size; ++i) {
+            cos_sin[i] = 2.f * ((rand() / (float)INT_MAX) - 0.5f);
+        }
+        for (int i = 0; i < num_tokens; ++i) {
+            positions[i] = rand() % max_positions;
         }
     }
 
     ~CPUInputs() {
-        delete[] q;
-        delete[] k;
+        delete[] qkv;
         delete[] q_w;
         delete[] k_w;
-        delete[] cos;
-        delete[] sin;
-        delete[] out_q;
-        delete[] out_k;
+        delete[] cos_sin;
+        delete[] positions;
+    }
+
+    void process_token(T *data, T *weight, T *cos_sin, int64_t num_head, int64_t head_size, double eps, bool is_neox_style) {
+        auto half_head_size = head_size / 2;
+        for (auto hid = 0; hid < num_head; ++hid) {
+            double x2 = 0;
+            auto offset = hid * head_size;
+            for (int h = 0; h < head_size; ++h) {
+                auto x = data[offset + h];
+                x2 += x * x;
+            }
+            double beta = (double)1.0 / std::sqrt(x2 / head_size + eps);
+            for (int h = 0; h < half_head_size; ++h) {
+                auto cos = cos_sin[h];
+                auto sin = cos_sin[h + half_head_size];
+                if (is_neox_style) {
+                    auto x0 = data[offset + h] * beta * weight[h];
+                    auto x1 = data[offset + h + half_head_size] * beta * weight[h + half_head_size];
+                    data[offset + h] = x0 * cos - x1 * sin;
+                    data[offset + h + half_head_size] = x1 * cos + x0 * sin;
+                } else {
+                    auto x0 = data[offset + h * 2 + 0] * beta * weight[h * 2 + 0];
+                    auto x1 = data[offset + h * 2 + 1] * beta * weight[h * 2 + 1];
+                    data[offset + h * 2 + 0] = x0 * cos - x1 * sin;
+                    data[offset + h * 2 + 1] = x1 * cos + x0 * sin;
+                }
+            }
+        }
     }
 
     void operator()() {
-        for (int tid = 0; tid < num_tokens; tid++) {
-            for (int hid = 0; hid < num_heads; hid++) {
-                double x2_q = 0;
-                double x2_k = 0;
-                int offset = (tid * num_heads + hid) * head_size;
-                for (int h = 0; h < head_size; ++h) {
-                    auto q_data = q[offset + h];
-                    auto k_data = k[offset + h];
-                    x2_q += q_data * q_data;
-                    x2_k += k_data * k_data;
-                }
-                double beta_q = (double)1.0 / std::sqrt(x2_q / head_size + eps);
-                double beta_k = (double)1.0 / std::sqrt(x2_k / head_size + eps);
-                for (int h = rotary_dim; h < head_size; ++h) {
-                    out_q[offset + h] = q[offset + h] * beta_q * q_w[h];
-                    out_k[offset + h] = k[offset + h] * beta_k * k_w[h];
-                }
-                int half_rotary_dim = rotary_dim / 2;
-                for (int h = 0; h < half_rotary_dim; ++h) {
-                    auto cos_ = cos[tid * head_size / 2 + h];
-                    auto sin_ = sin[tid * head_size / 2 + h];
-                    if (is_neox_style) {
-                        auto q1 = q[offset + h] * beta_q * q_w[h];
-                        auto k1 = k[offset + h] * beta_k * k_w[h];
-                        auto q2 = q[offset + h + half_rotary_dim] * beta_q * q_w[h + half_rotary_dim];
-                        auto k2 = k[offset + h + half_rotary_dim] * beta_k * k_w[h + half_rotary_dim];
-                        out_q[offset + h] = q1 * cos_ - q2 * sin_;
-                        out_q[offset + h + half_rotary_dim] = q2 * cos_ + q1 * sin_;
-                        out_k[offset + h] = k1 * cos_ - k2 * sin_;
-                        out_k[offset + h + half_rotary_dim] = k2 * cos_ + k1 * sin_;
-                    } else {
-                        auto q1 = q[offset + h * 2 + 0] * beta_q * q_w[h * 2 + 0];
-                        auto k1 = k[offset + h * 2 + 0] * beta_k * k_w[h * 2 + 0];
-                        auto q2 = q[offset + h * 2 + 1] * beta_q * q_w[h * 2 + 1];
-                        auto k2 = k[offset + h * 2 + 1] * beta_k * k_w[h * 2 + 1];
-                        out_q[offset + h * 2 + 0] = q1 * cos_ - q2 * sin_;
-                        out_q[offset + h * 2 + 1] = q2 * cos_ + q1 * sin_;
-                        out_k[offset + h * 2 + 0] = k1 * cos_ - k2 * sin_;
-                        out_k[offset + h * 2 + 1] = k2 * cos_ + k1 * sin_;
-                    }
-                }
-            }
+        for (auto tid = 0; tid < num_tokens; ++tid) {
+            auto cos_sin_ = &cos_sin[positions[tid] * head_size];
+            auto q = &qkv[tid * num_heads_ * head_size];
+            auto k = &q[num_heads_q * head_size];
+            process_token(q, q_w, cos_sin_, this->num_heads_q, this->head_size, this->eps, this->is_neox_style);
+            process_token(k, k_w, cos_sin_, this->num_heads_k, this->head_size, this->eps, this->is_neox_style);
         }
     }
 };
 
 template <typename T>
 class GPUInputs {
+    int64_t num_heads_;
+
 public:
-    int num_tokens;
-    int num_heads;
-    int head_size;
-    int rotary_dim;
+    int64_t num_tokens;
+    int64_t num_heads_q;
+    int64_t num_heads_k;
+    int64_t num_heads_v;
+    int64_t head_size;
     bool is_neox_style;
-    float eps;
-    int numel;
-    T *q;
-    T *k;
+    double eps;
+    int64_t max_positions;
+    T *qkv;
     T *q_w;
     T *k_w;
-    T *cos;
-    T *sin;
-    T *out_q;
-    T *out_k;
+    T *cos_sin;         // max_positions, head_size
+    int64_t *positions; // num_tokens
 
-    GPUInputs(int num_tokens, int num_heads, int head_size, int rotary_dim, bool is_neox_style, float eps) :
-        num_tokens(num_tokens), num_heads(num_heads), head_size(head_size),
-        rotary_dim(rotary_dim), is_neox_style(is_neox_style), eps(eps) {
-        numel = num_tokens * num_heads * head_size;
+    GPUInputs(
+        int64_t num_tokens,
+        int64_t num_heads_q,
+        int64_t num_heads_k,
+        int64_t num_heads_v,
+        int64_t head_size,
+        bool is_neox_style,
+        double eps,
+        int64_t max_positions) :
+        num_tokens(num_tokens),
+        num_heads_q(num_heads_q), num_heads_k(num_heads_k), num_heads_v(num_heads_v),
+        head_size(head_size), is_neox_style(is_neox_style), eps(eps), max_positions(max_positions) {
+        num_heads_ = num_heads_q + num_heads_k + num_heads_v;
     }
 
     void allocate() {
-        gpuMalloc(&q, numel * sizeof(T));
-        gpuMalloc(&k, numel * sizeof(T));
+        gpuMalloc(&qkv, num_tokens * num_heads_ * head_size * sizeof(T));
         gpuMalloc(&q_w, head_size * sizeof(T));
         gpuMalloc(&k_w, head_size * sizeof(T));
-        gpuMalloc(&cos, num_tokens * head_size / 2 * sizeof(T));
-        gpuMalloc(&sin, num_tokens * head_size / 2 * sizeof(T));
-        gpuMalloc(&out_q, numel * sizeof(T));
-        gpuMalloc(&out_k, numel * sizeof(T));
+        gpuMalloc(&cos_sin, max_positions * head_size * sizeof(T));
+        gpuMalloc(&positions, num_tokens * sizeof(int64_t));
         gpuDeviceSynchronize();
     }
 
     void reset(CPUInputs<T> &inputs) {
-        gpuMemcpy(q, inputs.q, numel * sizeof(T), gpuMemcpyHostToDevice);
-        gpuMemcpy(k, inputs.k, numel * sizeof(T), gpuMemcpyHostToDevice);
+        gpuMemcpy(qkv, inputs.qkv, num_tokens * num_heads_ * head_size * sizeof(T), gpuMemcpyHostToDevice);
         gpuMemcpy(q_w, inputs.q_w, head_size * sizeof(T), gpuMemcpyHostToDevice);
         gpuMemcpy(k_w, inputs.k_w, head_size * sizeof(T), gpuMemcpyHostToDevice);
-        gpuMemcpy(cos, inputs.cos, num_tokens * head_size / 2 * sizeof(T), gpuMemcpyHostToDevice);
-        gpuMemcpy(sin, inputs.sin, num_tokens * head_size / 2 * sizeof(T), gpuMemcpyHostToDevice);
+        gpuMemcpy(cos_sin, inputs.cos_sin, max_positions * head_size * sizeof(T), gpuMemcpyHostToDevice);
+        gpuMemcpy(positions, inputs.positions, num_tokens * sizeof(int64_t), gpuMemcpyHostToDevice);
         gpuDeviceSynchronize();
     }
 
     ~GPUInputs() {
-        gpuFree(q);
-        gpuFree(k);
+        gpuFree(qkv);
         gpuFree(q_w);
         gpuFree(k_w);
-        gpuFree(cos);
-        gpuFree(sin);
-        gpuFree(out_q);
-        gpuFree(out_k);
+        gpuFree(cos_sin);
+        gpuFree(positions);
         gpuDeviceSynchronize();
     }
 
@@ -178,16 +174,18 @@ public:
         gpuEventCreate(&stop);
         gpuEventRecord(start);
 
-        assert(head_size == rotary_dim);
-        rope_rms::fused_rope_rms(q, k, q_w, k_w, cos, sin, out_q, out_k, num_tokens, num_heads, head_size, is_neox_style, eps, 0);
+        // rope_rms::fused_rope_rms(q, k, q_w, k_w, cos_sin, positions, out_q, out_k, num_tokens, num_heads, head_size, is_neox_style, eps, 0);
+        rope_rms::fused_rope_rms<T>(qkv, q_w, k_w, cos_sin, positions, num_tokens, num_heads_q, num_heads_k, num_heads_v, head_size, is_neox_style, eps, 0);
         gpuDeviceSynchronize();
 
         gpuEventRecord(stop);
         gpuEventSynchronize(stop);
         float ms = 0;
         gpuEventElapsedTime(&ms, start, stop);
-        float input_bytes = (numel + head_size) * 2 * sizeof(T) + num_tokens * head_size * sizeof(T);
-        float output_bytes = numel * 2 * sizeof(T);
+        float input_bytes = num_tokens * (num_heads_q + num_heads_k) * head_size * sizeof(T)
+                            + 2 * head_size * sizeof(T)
+                            + num_tokens * head_size * sizeof(T);
+        float output_bytes = num_tokens * (num_heads_q + num_heads_k) * head_size * sizeof(T);
         float gbps = (input_bytes + output_bytes) / 1000.0 / 1000.0 / ms;
         return gbps;
     }
@@ -197,40 +195,34 @@ public:
     }
 
     bool validate(CPUInputs<T> &inputs, float atol) {
-        auto out_q_cpu = new T[numel];
-        auto out_k_cpu = new T[numel];
-        gpuMemcpy(out_q_cpu, out_q, numel * sizeof(T), gpuMemcpyDeviceToHost);
-        gpuMemcpy(out_k_cpu, out_k, numel * sizeof(T), gpuMemcpyDeviceToHost);
+        auto out_qkv_cpu = new T[num_tokens * num_heads_ * head_size];
+        gpuMemcpy(out_qkv_cpu, qkv, num_tokens * num_heads_ * head_size * sizeof(T), gpuMemcpyDeviceToHost);
         bool val = true;
-        for (int i = 0; i < numel; ++i) {
-            if (is_error(out_q_cpu[i], inputs.out_q[i], atol)) {
+        for (int i = 0; i < num_tokens * num_heads_ * head_size; ++i) {
+            if (is_error(out_qkv_cpu[i], inputs.qkv[i], atol)) {
                 val = false;
-                std::cout << "\n>>> out_q:" << out_q_cpu[i] << ", out_q_ref:" << inputs.out_q[i] << "\n";
-                break;
-            }
-            if (is_error(out_k_cpu[i], inputs.out_k[i], atol)) {
-                val = false;
-                std::cout << "\n>>> out_k:" << out_k_cpu[i] << ", out_k_ref:" << inputs.out_k[i] << "\n";
+                std::cout << "\n>>> out_qkv:" << out_qkv_cpu[i] << ", ref_qkv:" << inputs.qkv[i] << "\n";
                 break;
             }
         }
-        delete[] out_q_cpu;
-        delete[] out_k_cpu;
+        delete[] out_qkv_cpu;
         return val;
     }
 };
 
 template <typename T>
 std::tuple<bool, float> runbench(
-    int num_tokens,
-    int num_heads,
-    int head_size,
-    int rotary_dim,
+    int64_t num_tokens,
+    int64_t num_heads_q,
+    int64_t num_heads_k,
+    int64_t num_heads_v,
+    int64_t head_size,
     bool is_neox_style,
-    float eps,
+    double eps,
+    int64_t max_positions,
     float atol = 0.0001) {
-    CPUInputs<T> cpu_inputs(num_tokens, num_heads, head_size, rotary_dim, is_neox_style, eps);
-    GPUInputs<T> gpu_inputs(num_tokens, num_heads, head_size, rotary_dim, is_neox_style, eps);
+    CPUInputs<T> cpu_inputs(num_tokens, num_heads_q, num_heads_k, num_heads_v, head_size, is_neox_style, eps, max_positions);
+    GPUInputs<T> gpu_inputs(num_tokens, num_heads_q, num_heads_k, num_heads_v, head_size, is_neox_style, eps, max_positions);
     cpu_inputs.allocate();
     gpu_inputs.allocate();
     cpu_inputs.reset();
@@ -248,13 +240,14 @@ int main() {
     std::vector<int> num_tokens = {513, 1257, 127, 778, 10024, 3};
     std::vector<int> num_heads = {32, 64};
     std::vector<int> head_sizes = {128, 256};
-    float eps = 1e-6;
+    double eps = 1e-6;
+    int64_t max_positions = 10000;
     for (auto is_neox_style : is_neox_styles) {
         for (auto num_token : num_tokens) {
             for (auto num_head : num_heads) {
                 for (auto head_size : head_sizes) {
                     std::cout << "num_token:" << num_token << ", num_head:" << num_head << ", head_size:" << head_size << ", is_neox_style:" << is_neox_style;
-                    auto [val, gbps] = test::runbench<float>(num_token, num_head, head_size, head_size, is_neox_style, eps);
+                    auto [val, gbps] = test::runbench<float>(num_token, num_head, num_head, num_head, head_size, is_neox_style, eps, max_positions);
                     std::cout << ", val:" << val << ", gbps:" << gbps << "\n";
                 }
             }
