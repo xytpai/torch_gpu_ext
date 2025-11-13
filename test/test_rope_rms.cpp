@@ -174,7 +174,6 @@ public:
         gpuEventCreate(&stop);
         gpuEventRecord(start);
 
-        // rope_rms::fused_rope_rms(q, k, q_w, k_w, cos_sin, positions, out_q, out_k, num_tokens, num_heads, head_size, is_neox_style, eps, 0);
         rope_rms::fused_rope_rms<T>(qkv, q_w, k_w, cos_sin, positions, num_tokens, num_heads_q, num_heads_k, num_heads_v, head_size, is_neox_style, eps, 0);
         gpuDeviceSynchronize();
 
@@ -239,7 +238,7 @@ int main() {
     std::vector<bool> is_neox_styles = {true, false};
     std::vector<int> num_tokens = {513, 1257, 127, 778, 10024, 3};
     std::vector<int> num_heads = {32, 64};
-    std::vector<int> head_sizes = {128, 256};
+    std::vector<int> head_sizes = {64, 128, 256};
     double eps = 1e-6;
     int64_t max_positions = 10000;
     for (auto is_neox_style : is_neox_styles) {
