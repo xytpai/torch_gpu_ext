@@ -8,6 +8,8 @@
 #include <condition_variable>
 #include <cassert>
 #include <vector>
+#include <array>
+#include <numeric>
 #include <tuple>
 #include <unordered_map>
 

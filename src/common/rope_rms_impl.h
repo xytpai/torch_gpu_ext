@@ -121,44 +121,45 @@ __device__ __forceinline__ void warp_rms_norm_(
     }
 }
 
-template <typename T, int VEC_SIZE, int HEAD_SIZE, bool IS_INTERLEAVED>
+template <typename T, int VEC_SIZE, int HEAD_SIZE, bool IS_INTERLEAVED, int M>
 __device__ __forceinline__ void mrope_load_cos_sin_vec(vec_t<T, VEC_SIZE> &out,
-                                                       const T *cos_sin, int64_t position, int access_id_in_head, std::array<int64_t, 3> &mrope_section, int64_t max_positions) {
+                                                       const T *cos_sin, const int64_t *positions, int64_t token_id, int64_t num_tokens,
+                                                       int access_id_in_head, std::array<int64_t, M> &mrope_section) {
     constexpr int HALF_HEAD_SIZE = HEAD_SIZE / 2;
     if constexpr (IS_INTERLEAVED) {
         for (int i = 0; i < VEC_SIZE; ++i) {
             auto id = access_id_in_head + i;
             auto id_ = (access_id_in_head < HALF_HEAD_SIZE) ? id : id - HALF_HEAD_SIZE;
-            auto id3_ = id_ % 3;
-            if (id3_ == 1 && id_ < mrope_section[1] * 3) {
-                out[i] = cos_sin[(1 * max_positions + position) * HEAD_SIZE + id];
-            } else if (id3_ == 2 && id_ < mrope_section[2] * 3) {
-                out[i] = cos_sin[(2 * max_positions + position) * HEAD_SIZE + id];
+            auto mid_ = id_ % M;
+            if (mid_ >= 1 && id_ < mrope_section[mid_] * M) {
+                auto p = positions[mid_ * num_tokens + token_id];
+                out[i] = cos_sin[p * HEAD_SIZE + id];
             } else {
-                out[i] = cos_sin[position * HEAD_SIZE + id];
+                out[i] = cos_sin[positions[token_id] * HEAD_SIZE + id];
             }
         }
     } else {
         for (int i = 0; i < VEC_SIZE; ++i) {
             auto id = access_id_in_head + i;
             auto id_ = (access_id_in_head < HALF_HEAD_SIZE) ? id : id - HALF_HEAD_SIZE;
-            if (id_ < mrope_section[0]) {
-                out[i] = cos_sin[position * HEAD_SIZE + id];
-            } else if (id_ < mrope_section[0] + mrope_section[1]) {
-                out[i] = cos_sin[(1 * max_positions + position) * HEAD_SIZE + id];
-            } else {
-                out[i] = cos_sin[(2 * max_positions + position) * HEAD_SIZE + id];
+            int mid;
+            int end = 0;
+            for (mid = 0; mid < M; ++mid) {
+                end += mrope_section[mid];
+                if (id_ < end)
+                    break;
             }
+            auto p = positions[mid * num_tokens + token_id];
+            out[i] = cos_sin[p * HEAD_SIZE + id];
         }
     }
-    return out;
 }
 
-template <typename T, int HEAD_SIZE, bool IS_MROPE, bool IS_INTERLEAVED>
+template <typename T, int HEAD_SIZE, bool IS_MROPE, bool IS_INTERLEAVED, int M>
 __global__ void fused_mrope_rms_neox_kernel(
     T *qkv, const T *q_w, const T *k_w, const T *cos_sin, const int64_t *positions,
     int64_t num_heads_q, int64_t num_heads_k, int64_t num_heads_v, double eps,
-    std::array<int64_t, 3> mrope_section, int64_t max_positions, int64_t total_warps) {
+    std::array<int64_t, M> mrope_section, int64_t num_tokens, int64_t total_warps) {
     constexpr int VEC_SIZE = HEAD_SIZE / 32;
     constexpr int HALF_HEAD_SIZE = HEAD_SIZE / 2;
     const auto warp_id = threadIdx.x / 32;
@@ -173,7 +174,6 @@ __global__ void fused_mrope_rms_neox_kernel(
     auto access_id_in_head = (threadIdx.x % 32) * VEC_SIZE;
     auto neighbor_offset = access_id_in_head < HALF_HEAD_SIZE ? HALF_HEAD_SIZE / VEC_SIZE : -HALF_HEAD_SIZE / VEC_SIZE;
     auto qkv_ = qkv + token_id * (num_heads_q + num_heads_k + num_heads_v) * HEAD_SIZE + head_id_in_token * HEAD_SIZE;
-    auto position_ = positions[token_id];
 
     vec_t<T, VEC_SIZE> w_vec;
 
@@ -186,9 +186,10 @@ __global__ void fused_mrope_rms_neox_kernel(
     vec_t<T, VEC_SIZE> x_vec, cos_sin_vec;
     x_vec.load(qkv_ + access_id_in_head);
     if constexpr (IS_MROPE) {
-        mrope_load_cos_sin_vec<T, VEC_SIZE, HEAD_SIZE, IS_INTERLEAVED>(
-            cos_sin_vec, cos_sin, position_, access_id_in_head, mrope_section, max_positions);
+        mrope_load_cos_sin_vec<T, VEC_SIZE, HEAD_SIZE, IS_INTERLEAVED, M>(
+            cos_sin_vec, cos_sin, positions, token_id, num_tokens, access_id_in_head, mrope_section);
     } else {
+        auto position_ = positions[token_id];
         cos_sin_vec.load(&cos_sin[position_ * HEAD_SIZE + access_id_in_head]);
     }
 
@@ -210,11 +211,11 @@ __global__ void fused_mrope_rms_neox_kernel(
     out_vec.store(qkv_ + access_id_in_head);
 }
 
-template <typename T, int HEAD_SIZE, bool IS_MROPE, bool IS_INTERLEAVED>
+template <typename T, int HEAD_SIZE, bool IS_MROPE, bool IS_INTERLEAVED, int M>
 __global__ void fused_mrope_rms_noneox_kernel(
     T *qkv, const T *q_w, const T *k_w, const T *cos_sin, const int64_t *positions,
     int64_t num_heads_q, int64_t num_heads_k, int64_t num_heads_v, double eps,
-    std::array<int64_t, 3> mrope_section, int64_t max_positions, int64_t total_warps) {
+    std::array<int64_t, M> mrope_section, int64_t num_tokens, int64_t total_warps) {
     constexpr int VEC_SIZE = HEAD_SIZE / 32;
     constexpr int HALF_HEAD_SIZE = HEAD_SIZE / 2;
     const auto warp_id = threadIdx.x / 32;
@@ -228,7 +229,6 @@ __global__ void fused_mrope_rms_noneox_kernel(
     bool is_q = head_id_in_token < num_heads_q;
     auto access_id_in_head = (threadIdx.x % 32) * VEC_SIZE;
     auto qkv_ = qkv + token_id * (num_heads_q + num_heads_k + num_heads_v) * HEAD_SIZE + head_id_in_token * HEAD_SIZE;
-    auto position_ = positions[token_id];
 
     vec_t<T, VEC_SIZE> w_vec;
 
@@ -241,11 +241,12 @@ __global__ void fused_mrope_rms_noneox_kernel(
     vec_t<T, VEC_SIZE> x_vec, cos_vec, sin_vec;
     x_vec.load(qkv_ + access_id_in_head);
     if constexpr (IS_MROPE) {
-        mrope_load_cos_sin_vec<T, VEC_SIZE, HEAD_SIZE, IS_INTERLEAVED>(
-            cos_vec, cos_sin, position_, access_id_in_head / 2, mrope_section, max_positions);
-        mrope_load_cos_sin_vec<T, VEC_SIZE, HEAD_SIZE, IS_INTERLEAVED>(
-            sin_vec, cos_sin, position_, access_id_in_head / 2 + HALF_HEAD_SIZE, mrope_section, max_positions);
+        mrope_load_cos_sin_vec<T, VEC_SIZE, HEAD_SIZE, IS_INTERLEAVED, M>(
+            cos_vec, cos_sin, positions, token_id, num_tokens, access_id_in_head / 2, mrope_section);
+        mrope_load_cos_sin_vec<T, VEC_SIZE, HEAD_SIZE, IS_INTERLEAVED, M>(
+            sin_vec, cos_sin, positions, token_id, num_tokens, access_id_in_head / 2 + HALF_HEAD_SIZE, mrope_section);
     } else {
+        auto position_ = positions[token_id];
         cos_vec.load(&cos_sin[position_ * HEAD_SIZE + access_id_in_head / 2]);
         sin_vec.load(&cos_sin[position_ * HEAD_SIZE + access_id_in_head / 2 + HALF_HEAD_SIZE]);
     }
@@ -273,15 +274,15 @@ void fused_rope_rms(
     auto num_warps_per_block = block_size / 32;
     dim3 threadsPerBlock(block_size);
     dim3 numBlocks((total_warps + num_warps_per_block - 1) / num_warps_per_block);
-    std::array<int64_t, 3> mrope_section = {0, 0, 0};
+    std::array<int64_t, 1> mrope_section = {0};
 
-#define DISPATCH_NEOX(HEAD_SIZE)                                                                                           \
-    if (is_neox_style) {                                                                                                   \
-        fused_mrope_rms_neox_kernel<T, HEAD_SIZE, false, false><<<numBlocks, threadsPerBlock, 0, stream>>>(                \
-            qkv, q_w, k_w, cos_sin, positions, num_heads_q, num_heads_k, num_heads_v, eps, mrope_section, 0, total_warps); \
-    } else {                                                                                                               \
-        fused_mrope_rms_noneox_kernel<T, HEAD_SIZE, false, false><<<numBlocks, threadsPerBlock, 0, stream>>>(              \
-            qkv, q_w, k_w, cos_sin, positions, num_heads_q, num_heads_k, num_heads_v, eps, mrope_section, 0, total_warps); \
+#define DISPATCH_NEOX(HEAD_SIZE)                                                                                                    \
+    if (is_neox_style) {                                                                                                            \
+        fused_mrope_rms_neox_kernel<T, HEAD_SIZE, false, false, 1><<<numBlocks, threadsPerBlock, 0, stream>>>(                      \
+            qkv, q_w, k_w, cos_sin, positions, num_heads_q, num_heads_k, num_heads_v, eps, mrope_section, num_tokens, total_warps); \
+    } else {                                                                                                                        \
+        fused_mrope_rms_noneox_kernel<T, HEAD_SIZE, false, false, 1><<<numBlocks, threadsPerBlock, 0, stream>>>(                    \
+            qkv, q_w, k_w, cos_sin, positions, num_heads_q, num_heads_k, num_heads_v, eps, mrope_section, num_tokens, total_warps); \
     }
 
     switch (head_size) {
@@ -299,25 +300,27 @@ void fused_rope_rms(
 #undef DISPATCH_NEOX
 }
 
-template <typename T>
+template <typename T, int M>
 void fused_mrope_rms(
     T *qkv, const T *q_w, const T *k_w, const T *cos_sin, const int64_t *positions,
     int64_t num_tokens, int64_t num_heads_q, int64_t num_heads_k, int64_t num_heads_v, int64_t head_size,
-    bool is_neox_style, double eps, std::array<int64_t, 3> mrope_section, int64_t max_positions, bool is_interleaved, gpuStream_t stream) {
+    bool is_neox_style, double eps, std::array<int64_t, M> mrope_section, bool is_interleaved, gpuStream_t stream) {
     assert(head_size == 64 || head_size == 128 || head_size == 256);
+    auto dim = std::accumulate(mrope_section.begin(), mrope_section.end(), 0);
+    assert(dim == head_size / 2);
     constexpr int block_size = 256;
     auto total_warps = num_tokens * (num_heads_q + num_heads_k);
     auto num_warps_per_block = block_size / 32;
     dim3 threadsPerBlock(block_size);
     dim3 numBlocks((total_warps + num_warps_per_block - 1) / num_warps_per_block);
 
-#define DISPATCH_NEOX(HEAD_SIZE, IS_INTERLEAVED)                                                                                       \
-    if (is_neox_style) {                                                                                                               \
-        fused_mrope_rms_neox_kernel<T, HEAD_SIZE, IS_INTERLEAVED><<<numBlocks, threadsPerBlock, 0, stream>>>(                          \
-            qkv, q_w, k_w, cos_sin, positions, num_heads_q, num_heads_k, num_heads_v, eps, mrope_section, max_positions, total_warps); \
-    } else {                                                                                                                           \
-        fused_mrope_rms_noneox_kernel<T, HEAD_SIZE, IS_INTERLEAVED><<<numBlocks, threadsPerBlock, 0, stream>>>(                        \
-            qkv, q_w, k_w, cos_sin, positions, num_heads_q, num_heads_k, num_heads_v, eps, mrope_section, max_positions, total_warps); \
+#define DISPATCH_NEOX(HEAD_SIZE, IS_INTERLEAVED)                                                                                    \
+    if (is_neox_style) {                                                                                                            \
+        fused_mrope_rms_neox_kernel<T, HEAD_SIZE, true, IS_INTERLEAVED, M><<<numBlocks, threadsPerBlock, 0, stream>>>(              \
+            qkv, q_w, k_w, cos_sin, positions, num_heads_q, num_heads_k, num_heads_v, eps, mrope_section, num_tokens, total_warps); \
+    } else {                                                                                                                        \
+        fused_mrope_rms_noneox_kernel<T, HEAD_SIZE, true, IS_INTERLEAVED, M><<<numBlocks, threadsPerBlock, 0, stream>>>(            \
+            qkv, q_w, k_w, cos_sin, positions, num_heads_q, num_heads_k, num_heads_v, eps, mrope_section, num_tokens, total_warps); \
     }
 
     if (is_interleaved) {
